@@ -1,14 +1,23 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Management;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Timers;
 using CommandLine;
+using CSCore.CoreAudioAPI;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Edge;
+using OpenQA.Selenium.Interactions;
 using OpenQA.Selenium.Remote;
 using OpenQA.Selenium.Support.UI;
+using PlexAutoIntroSkip.Models;
 
 namespace PlexAutoIntroSkip
 {
@@ -24,9 +33,13 @@ namespace PlexAutoIntroSkip
                 HelpText = "Time to wait after Skip Button becomes visible before clicking.")]
             public int SkipButtonWaitTime { get; set; }
 
+            [Option('v', "auto-volume", Required = false, Default = false)]
+            public bool AutoVolume { get; set; }
+
             [Value(0, MetaName = "plex-url", HelpText = "Plex URL to use.")]
             public string PlexUrl { get; set; }
         }
+        
 
         /// <summary>
         /// Sets the specified window's show state.
@@ -43,12 +56,19 @@ namespace PlexAutoIntroSkip
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
+
         /// <summary>
         /// Program entry point.
         /// </summary>
         /// <param name="args">Command-line arguments.</param>
         public static void Main(string[] args)
         {
+
+#if DEBUG
+            args = new[] {"", "--v"};
+#endif
+
+
             var options = GetProgramOptions(args);
             var hWnd = Process.GetCurrentProcess().MainWindowHandle;
             var edgeProcessName = "msedge";
@@ -79,6 +99,65 @@ namespace PlexAutoIntroSkip
                 .Except(edgeProcessIds)
                 .First();
 
+            if (options.AutoVolume)
+            {
+                AudioControlSettings audioControlSettings = new AudioControlSettings { AudioLogs = new List<double>(), VolumeTolerance = 0.05, VolumeGatherTimeInSeconds = 5};
+
+                Task.Factory.StartNew(() =>
+                {
+                    Debug.WriteLine("Searching for audio process...");
+                    while (audioControlSettings.AudioProcess == null)
+                    {
+
+                        // Gets all processes that have audio
+                        using var audioSessionManager = AudioSessionManager2.FromMMDevice(new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia));
+
+                        // Loop through each audio session to find the process associated with the webdriver
+                        foreach (var session in audioSessionManager.GetSessionEnumerator().Where(s => s.QueryInterface<AudioSessionControl2>().Process.ProcessName.Contains("edge")))
+                        {
+
+                            var tempAudioProcessId = session.QueryInterface<AudioSessionControl2>().ProcessID;
+
+                            // Get the parent process ID of the audio session
+                            using ManagementObject managementObject = new ManagementObject("win32_process.handle='" + tempAudioProcessId + "'");
+                            managementObject.Get();
+
+                            if(Convert.ToInt32(managementObject["ParentProcessId"]) != browserProcessId) continue;
+
+                            Debug.WriteLine("Audio process found!  PID: {0}", tempAudioProcessId);
+
+                            audioControlSettings.AudioProcessID = tempAudioProcessId;
+                            audioControlSettings.AudioProcess = audioSessionManager.GetSessionEnumerator().FirstOrDefault(s => s.QueryInterface<AudioSessionControl2>().ProcessID == tempAudioProcessId)?.QueryInterface<AudioSessionControl2>();
+
+                            managementObject.Dispose();
+                        }
+                        audioSessionManager.Dispose();
+                    }
+
+                    GatherAudioSamples(audioControlSettings, browserProcessId);
+                    audioControlSettings.VolumeTarget = audioControlSettings.AverageVolume;
+
+
+                    var volumeSliderThumb = driver.FindElementByClassName("VerticalSlider-thumb-1y9RTp");
+                    int volumeSliderPos = int.TryParse(volumeSliderThumb.GetAttribute("aria-valuenow"), out int result) ? result : 50;
+                    audioControlSettings.VolumeSliderPosition = volumeSliderPos;
+
+
+                    while (ProcessExistsById(browserProcessId))
+                    {
+                        try
+                        {
+                            ReadCurrentAudio(audioControlSettings, driver, browserProcessId);
+                            Thread.Sleep(500);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogException(ex);
+                        }
+                    }
+                });
+            }
+
             while (ProcessExistsById(browserProcessId))
             {
                 try
@@ -93,6 +172,62 @@ namespace PlexAutoIntroSkip
 
             Process.GetProcessById(service.ProcessId).Kill();
         }
+
+
+        private static void ReadCurrentAudio(AudioControlSettings audioControlSettings, EdgeDriver driver, int browserPID)
+        {
+
+            try
+            {
+                float? audioLog = audioControlSettings.AudioProcess.QueryInterface<AudioMeterInformation>()?.PeakValue;
+                // ReSharper disable once CompareOfFloatsByEqualityOperator
+                if (audioLog == null || audioLog == 0 || audioLog.ToString().Contains("E")) return;
+
+                //var volumeSlider = driver.FindElementByClassName("PlayerControls-volumeSlider-qbq5Ws");
+                var volumeSliderThumb = driver.FindElementByClassName("VerticalSlider-thumb-1y9RTp");
+                int? currentVolumeSliderPos = int.TryParse(volumeSliderThumb.GetAttribute("aria-valuenow"), out int result) ? result : (int?)null;
+                if (!currentVolumeSliderPos.HasValue) return;
+
+                // If the slider moved by user get the new target volume
+                if (audioControlSettings.VolumeSliderPosition != currentVolumeSliderPos)
+                {
+                    GatherAudioSamples(audioControlSettings, browserPID);
+                    audioControlSettings.VolumeTarget = audioControlSettings.AverageVolume;
+                    audioControlSettings.VolumeSliderPosition = (int) currentVolumeSliderPos;
+                    return;
+                }
+
+                audioControlSettings.AudioLogs.Add((double) audioLog);
+                audioControlSettings.AudioLogs.RemoveAt(0);
+
+                // Adjust audio to meet user settings
+                if (audioControlSettings.AverageVolume - audioControlSettings.VolumeTolerance > audioControlSettings.VolumeTarget || audioControlSettings.AverageVolume + audioControlSettings.VolumeTolerance < audioControlSettings.VolumeTarget)
+                {
+
+                    //int pixelsPerPercent = 100 / volumeSlider.Size.Height;
+
+                    Actions move = new Actions(driver);
+                    //var moveSlider = move.DragAndDropToOffset(volumeSliderThumb,0, _audioLogs.Average() - .05 > _targetVolume ? pixelsPerPercent : -pixelsPerPercent).Build();
+                    var moveSlider = move.SendKeys(audioControlSettings.AverageVolume - audioControlSettings.VolumeTolerance > audioControlSettings.VolumeTarget ? Keys.Down : Keys.Up).Build();
+                    moveSlider.Perform();
+
+                    // Set the new slider position
+                    volumeSliderThumb = driver.FindElementByClassName("VerticalSlider-thumb-1y9RTp");
+                    currentVolumeSliderPos = int.TryParse(volumeSliderThumb.GetAttribute("aria-valuenow"), out result) ? result : 0;
+                    audioControlSettings.VolumeSliderPosition = (int) currentVolumeSliderPos;
+
+                    GatherAudioSamples(audioControlSettings, browserPID);
+                    Debug.WriteLine("Adjusted volume " + (audioControlSettings.AverageVolume - audioControlSettings.VolumeTolerance > audioControlSettings.VolumeTarget ? "down" : "up"));
+                }
+            }
+            catch (Exception exception)
+            {
+                LogException(exception);
+            }
+
+            Debug.WriteLine("Average Volume: {0}", audioControlSettings.AverageVolume);
+        }
+
 
         /// <summary>
         /// Run main program loop.
@@ -116,7 +251,7 @@ namespace PlexAutoIntroSkip
 
                 // Skip Intro button will only be equal to `nullWebElement` if the browser process
                 // no longer exists.
-                if (skipIntroButton == nullWebElement)
+                if (Equals(skipIntroButton, nullWebElement))
                 {
                     break;
                 }
@@ -151,10 +286,42 @@ namespace PlexAutoIntroSkip
         private static ProgramOptions GetProgramOptions(string[] args)
         {
             ProgramOptions options = null;
-            CommandLine.Parser.Default.ParseArguments<ProgramOptions>(args)
-                .WithParsed(parsedOptions => options = parsedOptions);
+            CommandLine.Parser.Default.ParseArguments<ProgramOptions>(args).WithParsed(parsedOptions => options = parsedOptions);
 
             return options;
+        }
+
+        /// <summary>
+        /// Gathers audio samples for a specified amount of time.
+        /// </summary>
+        /// <param name="audioControlSettings"></param>
+        /// <param name="browserPID"></param>
+        private static void GatherAudioSamples(AudioControlSettings audioControlSettings, int browserPID)
+        {
+            audioControlSettings.AudioLogs.Clear();
+
+            // Gather enough data for an average volume
+            while (audioControlSettings.AudioLogs.Count < audioControlSettings.VolumeGatherTimeInSeconds)
+            {
+                try
+                {
+                    // Make sure process is still running
+                    if (!ProcessExistsById(browserPID)) return;
+
+                    using var audioMeterInformation = audioControlSettings.AudioProcess?.QueryInterface<AudioMeterInformation>();
+
+                    if (audioMeterInformation?.PeakValue == null || Math.Abs(audioMeterInformation.PeakValue) < 0 || audioMeterInformation.PeakValue.ToString(CultureInfo.InvariantCulture).Contains("E")) continue;
+
+                    audioControlSettings.AudioLogs.Add(audioMeterInformation.PeakValue);
+
+                    if (audioControlSettings.AudioLogs.Count < audioControlSettings.VolumeGatherTimeInSeconds) Thread.Sleep(1000);
+                }
+                catch (Exception exception)
+                {
+                    LogException(exception);
+                }
+            }
+
         }
 
         /// <summary>
@@ -186,7 +353,6 @@ namespace PlexAutoIntroSkip
         /// </summary>
         /// <param name="processId">Process ID.</param>
         /// <returns>True if process exists, otherwise false.</returns>
-        private static bool ProcessExistsById(int processId)
-            => Process.GetProcesses().Any(p => p.Id == processId);
+        private static bool ProcessExistsById(int processId) => Process.GetProcesses().Any(p => p.Id == processId);
     }
 }
